@@ -1,0 +1,9 @@
+name: app_environment
+channels:
+  - snowflake
+dependencies:
+  - langchain-core=*
+  - langgraph=*
+  - pydantic=*
+  - snowflake-ml-python=*
+  - snowflake-snowpark-python=*
