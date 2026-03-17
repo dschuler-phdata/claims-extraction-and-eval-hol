@@ -65,3 +65,19 @@ SELECT
         ELSE 'ERROR: FIMA_CLAIMS table is empty. Please check the data load.'
     END AS setup_status
 FROM FIMA_CLAIMS;
+
+CREATE OR REPLACE STAGE manuals_stage 
+    DIRECTORY = (ENABLE = TRUE)
+    ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
+
+ALTER GIT REPOSITORY claims_extraction_repo FETCH;
+
+COPY FILES 
+    INTO @manuals_stage 
+    FROM @claims_extraction_repo/branches/main/06-2025-claims-manual.pdf;
+
+CREATE OR REPLACE TABLE CLAIMS_MANUAL_CHUNKS (
+    relative_path STRING,
+    chunk_index INTEGER,
+    chunk_text STRING
+);
