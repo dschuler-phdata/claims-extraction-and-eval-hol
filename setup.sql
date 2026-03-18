@@ -77,16 +77,19 @@ CREATE OR REPLACE PROCEDURE CLAIMS_EXTRACTION_LAB.HOL.EXTRACT_CLAIMS_PARALLEL(
 RETURNS VARIANT
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
-PACKAGES = ('snowflake-snowpark-python', 'pydantic')
+PACKAGES = ('snowflake-snowpark-python', 'pydantic', 'langgraph')
 HANDLER = 'run'
 EXECUTE AS CALLER
 AS
 $$
 import json
 import time
-from typing import Optional
+import operator
+from typing import TypedDict, Optional, Annotated
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pydantic import BaseModel, Field, ValidationError, field_validator
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -207,18 +210,70 @@ def schema_for_group(group_key):
     }
 
 
-# ── Per-group extraction with validate/fix loop ───────────────────────────────
+# ── Cortex helper ─────────────────────────────────────────────────────────────
 
-def extract_group(session, adjuster_notes, group_key, max_retries):
-    group_info   = FIELD_GROUPS[group_key]
-    fields       = group_info["fields"]
-    label        = group_info["label"]
-    cortex_calls = 0
+# Store session reference for use in node functions
+_session = None
+
+CORTEX_SQL = "SELECT SNOWFLAKE.CORTEX.COMPLETE('claude-sonnet-4-6', PARSE_JSON(?), PARSE_JSON(?)) :structured_output[0]:raw_message::STRING AS result"
+
+def cortex_complete(prompt_json, schema_json):
+    options = json.dumps({"temperature": 0, "response_format": {"type": "json", "schema": json.loads(schema_json)}})
+    return _session.sql(CORTEX_SQL, [prompt_json, options]).collect()[0][0]
+
+
+# ── LangGraph State Types ─────────────────────────────────────────────────────
+
+class ExtractionState(TypedDict):
+    claim_id: str
+    adjuster_notes: str
+    max_retries: int
+    group_results: Annotated[list, operator.add]
+    validated_extraction: dict
+    extraction_errors: list
+    is_valid: bool
+    retry_count: int
+    node_history: Annotated[list, operator.add]
+    cortex_calls: int
+    processing_time: float
+
+
+class WorkerOutput(TypedDict):
+    group_results: Annotated[list, operator.add]
+    node_history: Annotated[list, operator.add]
+
+
+class GroupWorkerState(TypedDict):
+    claim_id: str
+    adjuster_notes: str
+    group_key: str
+    group_fields: list
+    group_label: str
+    max_retries: int
+    extracted_fields: dict
+    extraction_errors: list
+    is_valid: bool
+    retry_count: int
+    cortex_calls: int
+    processing_time: float
+    group_results: Annotated[list, operator.add]
+    node_history: Annotated[list, operator.add]
+
+
+# ── LangGraph Node Functions ──────────────────────────────────────────────────
+
+def extract_group_node(state: GroupWorkerState) -> dict:
+    """Extract fields for a single group via Cortex."""
+    start_time = time.time()
+    group_key = state["group_key"]
+    fields = state["group_fields"]
+    label = state["group_label"]
 
     field_descriptions = "\\n".join(
         f"- {f}: {ClaimExtractionValidated.model_fields[f].description}"
         for f in fields
     )
+
     extraction_prompt = json.dumps([
         {
             "role": "system",
@@ -226,129 +281,306 @@ def extract_group(session, adjuster_notes, group_key, max_retries):
                 f"You are an expert insurance data extraction system. "
                 f"Extract ONLY the following {label} fields from the adjuster notes. "
                 f"Be precise with numbers, dates, and codes. "
-                f"If a field is not mentioned or cannot be reasonably inferred, use null.\\n\\n"
+                f"If a field is not mentioned or cannot be reasonably inferred from the notes, use null.\\n\\n"
                 f"Fields to extract:\\n{field_descriptions}"
             )
         },
-        {"role": "user", "content": adjuster_notes}
+        {"role": "user", "content": state["adjuster_notes"]}
     ])
+
     group_schema = json.dumps(schema_for_group(group_key))
-
-    cortex_sql = "SELECT SNOWFLAKE.CORTEX.COMPLETE('claude-3-5-sonnet', PARSE_JSON(?), {'temperature': 0, 'response_format': {'type': 'json', 'schema': PARSE_JSON(?)}}) :structured_output[0]:raw_message::STRING AS result"
-
-    result = session.sql(cortex_sql, [extraction_prompt, group_schema]).collect()[0][0]
-    extracted    = json.loads(result)
-    cortex_calls += 1
-
-    retry_count = 0
-    errors      = []
-    is_valid    = False
-
-    for attempt in range(max_retries + 1):
-        try:
-            validated = ClaimExtractionValidated(**extracted)
-            extracted = {f: getattr(validated, f) for f in fields}
-            is_valid  = True
-            errors    = []
-            break
-        except ValidationError as e:
-            errors = [
-                {
-                    "field":       ".".join(str(x) for x in err["loc"]),
-                    "message":     err["msg"],
-                    "input_value": str(err.get("input", ""))[:100],
-                }
-                for err in e.errors()
-                if ".".join(str(x) for x in err["loc"]) in fields
-            ]
-            if not errors:
-                is_valid = True
-                break
-            if attempt < max_retries:
-                error_desc = "\\n".join(
-                    f"- Field {e['field']}: {e['message']} (current: {e['input_value']})"
-                    for e in errors
-                )
-                fix_prompt = json.dumps([
-                    {
-                        "role": "system",
-                        "content": (
-                            f"You are an expert insurance data extraction system. "
-                            f"A previous extraction for {label} fields had validation errors. "
-                            f"Fix ONLY the fields with errors. Keep correct fields unchanged.\\n\\n"
-                            f"Fields:\\n{field_descriptions}"
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Original adjuster notes:\\n{adjuster_notes}\\n\\n"
-                            f"Previous extraction:\\n{json.dumps(extracted, indent=2)}\\n\\n"
-                            f"Validation errors:\\n{error_desc}\\n\\n"
-                            "Please provide the corrected extraction."
-                        )
-                    }
-                ])
-                result = session.sql(cortex_sql, [fix_prompt, group_schema]).collect()[0][0]
-                extracted    = json.loads(result)
-                cortex_calls += 1
-                retry_count  += 1
-        except Exception:
-            raise
+    result = cortex_complete(extraction_prompt, group_schema)
+    extracted = json.loads(result)
+    elapsed = time.time() - start_time
 
     return {
-        "group_key":    group_key,
-        "fields":       extracted,
-        "is_valid":     is_valid,
-        "retry_count":  retry_count,
-        "cortex_calls": cortex_calls,
-        "errors":       errors,
+        "extracted_fields": extracted,
+        "cortex_calls": 1,
+        "processing_time": elapsed,
+        "node_history": [f"extract_{group_key}"],
     }
 
 
-# ── Process one claim ─────────────────────────────────────────────────────────
+def validate_group_node(state: GroupWorkerState) -> dict:
+    """Validate a single group's extracted fields using Pydantic domain rules."""
+    group_key = state["group_key"]
+    fields = state["group_fields"]
+    raw = state["extracted_fields"]
 
-def process_claim(session, claim_id, adjuster_notes, max_retries):
+    try:
+        validated = ClaimExtractionValidated(**raw)
+        validated_fields = {f: getattr(validated, f) for f in fields}
+
+        result = {
+            "extracted_fields": validated_fields,
+            "extraction_errors": [],
+            "is_valid": True,
+            "node_history": [f"validate_{group_key}_pass"],
+            "group_results": [{
+                "group_key": group_key,
+                "fields": validated_fields,
+                "is_valid": True,
+                "retry_count": state.get("retry_count", 0),
+                "cortex_calls": state.get("cortex_calls", 0),
+                "processing_time": state.get("processing_time", 0),
+                "errors": [],
+            }],
+        }
+        return result
+
+    except Exception as e:
+        errors = []
+        if hasattr(e, 'errors'):
+            for err in e.errors():
+                field_name = ".".join(str(x) for x in err["loc"])
+                if field_name in fields:
+                    errors.append({
+                        "field": field_name,
+                        "message": err["msg"],
+                        "type": err["type"],
+                        "input_value": str(err.get("input", ""))[:100]
+                    })
+        else:
+            errors.append({"field": "unknown", "message": str(e), "type": "general"})
+
+        result = {
+            "extraction_errors": errors,
+            "is_valid": False,
+            "node_history": [f"validate_{group_key}_fail"],
+        }
+
+        # No group-specific errors means this group is actually valid
+        if not errors:
+            result["is_valid"] = True
+            result["node_history"] = [f"validate_{group_key}_pass"]
+            result["group_results"] = [{
+                "group_key": group_key,
+                "fields": raw,
+                "is_valid": True,
+                "retry_count": state.get("retry_count", 0),
+                "cortex_calls": state.get("cortex_calls", 0),
+                "processing_time": state.get("processing_time", 0),
+                "errors": [],
+            }]
+        # Max retries exhausted — finalize with errors so we don't block merge
+        elif state.get("retry_count", 0) >= state.get("max_retries", 2):
+            result["group_results"] = [{
+                "group_key": group_key,
+                "fields": raw,
+                "is_valid": False,
+                "retry_count": state.get("retry_count", 0),
+                "cortex_calls": state.get("cortex_calls", 0),
+                "processing_time": state.get("processing_time", 0),
+                "errors": errors,
+            }]
+
+        return result
+
+
+def fix_group_node(state: GroupWorkerState) -> dict:
+    """Re-prompt Cortex with specific validation errors to fix a single group."""
     start_time = time.time()
+    group_key = state["group_key"]
+    label = state["group_label"]
+    fields = state["group_fields"]
 
-    group_results = [
-        extract_group(session, adjuster_notes, gk, max_retries)
-        for gk in FIELD_GROUPS
+    error_descriptions = "\\n".join([
+        f"- Field '{e['field']}': {e['message']} (current value: {e['input_value']})"
+        for e in state["extraction_errors"]
+    ])
+
+    field_descriptions = "\\n".join(
+        f"- {f}: {ClaimExtractionValidated.model_fields[f].description}"
+        for f in fields
+    )
+
+    fix_prompt = json.dumps([
+        {
+            "role": "system",
+            "content": (
+                f"You are an expert insurance data extraction system. "
+                f"A previous extraction attempt for {label} fields had validation errors. "
+                f"Fix ONLY the fields with errors. "
+                f"Keep all correctly extracted fields unchanged.\\n\\n"
+                f"Fields:\\n{field_descriptions}"
+            )
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Original adjuster notes:\\n{state['adjuster_notes']}\\n\\n"
+                f"Previous extraction (with errors):\\n{json.dumps(state['extracted_fields'], indent=2)}\\n\\n"
+                f"Validation errors to fix:\\n{error_descriptions}\\n\\n"
+                "Please provide the corrected extraction for these fields only."
+            )
+        }
+    ])
+
+    group_schema = json.dumps(schema_for_group(group_key))
+    result = cortex_complete(fix_prompt, group_schema)
+    extracted = json.loads(result)
+    elapsed = time.time() - start_time
+
+    return {
+        "extracted_fields": extracted,
+        "retry_count": state.get("retry_count", 0) + 1,
+        "cortex_calls": state.get("cortex_calls", 0) + 1,
+        "processing_time": state.get("processing_time", 0) + elapsed,
+        "node_history": [f"fix_{group_key}"],
+    }
+
+
+def merge_groups_node(state: ExtractionState) -> dict:
+    """Merge validated results from all group workers into one extraction dict."""
+    merged = {}
+    total_calls = 0
+    total_time = 0.0
+    total_retries = 0
+    all_valid = True
+    all_errors = []
+
+    for group_result in state.get("group_results", []):
+        merged.update(group_result["fields"])
+        total_calls += group_result.get("cortex_calls", 0)
+        total_time += group_result.get("processing_time", 0)
+        total_retries += group_result.get("retry_count", 0)
+        if not group_result.get("is_valid", False):
+            all_valid = False
+        all_errors.extend(group_result.get("errors", []))
+
+    return {
+        "validated_extraction": merged,
+        "is_valid": all_valid,
+        "cortex_calls": total_calls,
+        "processing_time": total_time,
+        "retry_count": total_retries,
+        "extraction_errors": all_errors,
+        "node_history": ["merge"],
+    }
+
+
+def should_retry_group(state: GroupWorkerState) -> str:
+    """Decide whether to retry this group's extraction or finish the worker."""
+    if state.get("is_valid", False):
+        return END
+    elif state.get("retry_count", 0) < state.get("max_retries", 2):
+        return "fix_group"
+    else:
+        return END
+
+
+def finalize_node(state: ExtractionState) -> dict:
+    """Finalize the extraction result with metadata."""
+    result = state.get("validated_extraction", {})
+
+    result["_metadata"] = {
+        "claim_id": state["claim_id"],
+        "is_valid": state.get("is_valid", False),
+        "retry_count": state.get("retry_count", 0),
+        "cortex_calls": state.get("cortex_calls", 0),
+        "node_path": " -> ".join(state.get("node_history", []) + ["finalize"]),
+        "processing_time_seconds": round(state.get("processing_time", 0), 2),
+        "had_errors": len(state.get("extraction_errors", [])) > 0
+    }
+
+    return {
+        "validated_extraction": result,
+        "node_history": ["finalize"]
+    }
+
+
+def fan_out_to_groups(state: ExtractionState) -> list:
+    """Route to one extraction worker per field group using LangGraph Send."""
+    return [
+        Send("group_worker", {
+            "claim_id": state["claim_id"],
+            "adjuster_notes": state["adjuster_notes"],
+            "group_key": group_key,
+            "group_fields": group_info["fields"],
+            "group_label": group_info["label"],
+            "max_retries": state.get("max_retries", 2),
+            "extracted_fields": {},
+            "extraction_errors": [],
+            "is_valid": False,
+            "retry_count": 0,
+            "cortex_calls": 0,
+            "processing_time": 0.0,
+            "group_results": [],
+            "node_history": [],
+        })
+        for group_key, group_info in FIELD_GROUPS.items()
     ]
 
-    merged        = {}
-    total_calls   = 0
-    total_retries = 0
-    all_valid     = True
-    all_errors    = []
 
-    for gr in group_results:
-        merged.update(gr["fields"])
-        total_calls   += gr["cortex_calls"]
-        total_retries += gr["retry_count"]
-        all_valid      = all_valid and gr["is_valid"]
-        all_errors.extend(gr["errors"])
+# ── Build LangGraph ───────────────────────────────────────────────────────────
 
-    elapsed   = round(time.time() - start_time, 2)
-    node_path = " | ".join(
-        f"{gr['group_key']}({gr['cortex_calls']}calls)" for gr in group_results
-    )
-    merged["_metadata"] = {
-        "claim_id":                claim_id,
-        "is_valid":                all_valid,
-        "retry_count":             total_retries,
-        "cortex_calls":            total_calls,
-        "processing_time_seconds": elapsed,
+# Worker subgraph: extract → validate → fix loop
+worker_builder = StateGraph(GroupWorkerState, output_schema=WorkerOutput)
+worker_builder.add_node(node="extract_group", action=extract_group_node)
+worker_builder.add_node(node="validate_group", action=validate_group_node)
+worker_builder.add_node(node="fix_group", action=fix_group_node)
+
+worker_builder.add_edge(start_key=START, end_key="extract_group")
+worker_builder.add_edge(start_key="extract_group", end_key="validate_group")
+worker_builder.add_conditional_edges(
+    source="validate_group",
+    path=should_retry_group,
+    path_map={"fix_group": "fix_group", END: END}
+)
+worker_builder.add_edge("fix_group", "validate_group")
+worker_subgraph = worker_builder.compile()
+
+# Parent graph: fan-out → workers → merge → finalize
+workflow = StateGraph(ExtractionState)
+workflow.add_node("group_worker", worker_subgraph)
+workflow.add_node("merge", merge_groups_node)
+workflow.add_node("finalize", finalize_node)
+
+workflow.add_conditional_edges(
+    START,
+    fan_out_to_groups,
+    ["group_worker"]
+)
+workflow.add_edge("group_worker", "merge")
+workflow.add_edge("merge", "finalize")
+workflow.add_edge("finalize", END)
+
+extraction_graph = workflow.compile()
+
+
+# ── Process one claim via LangGraph ───────────────────────────────────────────
+
+def process_claim(session, claim_id, adjuster_notes, max_retries):
+    global _session
+    _session = session
+
+    initial_state = {
+        "claim_id": claim_id,
+        "adjuster_notes": adjuster_notes,
+        "max_retries": max_retries,
+        "group_results": [],
+        "validated_extraction": {},
+        "extraction_errors": [],
+        "retry_count": 0,
+        "is_valid": False,
+        "node_history": [],
+        "cortex_calls": 0,
+        "processing_time": 0.0,
     }
 
-    merged_json = json.dumps(merged)
-    errors_json = json.dumps(all_errors)
+    start_time = time.time()
+    result = extraction_graph.invoke(initial_state)
+    elapsed = round(time.time() - start_time, 2)
+
+    node_path = " -> ".join(result["node_history"])
+    merged_json = json.dumps(result["validated_extraction"])
+    errors_json = json.dumps(result.get("extraction_errors", []))
 
     session.sql("DELETE FROM EXTRACTION_RESULTS WHERE claim_id = ?", [claim_id]).collect()
 
     session.sql(
-        "INSERT INTO EXTRACTION_RESULTS (claim_id, extracted_data, is_valid, retry_count, cortex_calls, processing_time_seconds, node_path, extraction_errors) VALUES (?, PARSE_JSON(?), ?, ?, ?, ?, ?, PARSE_JSON(?))",
-        [claim_id, merged_json, all_valid, total_retries, total_calls, elapsed, node_path, errors_json]
+        "INSERT INTO EXTRACTION_RESULTS (claim_id, extracted_data, is_valid, retry_count, cortex_calls, processing_time_seconds, node_path, extraction_errors) SELECT ?, PARSE_JSON(?), ?, ?, ?, ?, ?, PARSE_JSON(?)",
+        [claim_id, merged_json, result["is_valid"], result["retry_count"], result["cortex_calls"], elapsed, node_path, errors_json]
     ).collect()
 
     session.sql(
@@ -358,16 +590,19 @@ def process_claim(session, claim_id, adjuster_notes, max_retries):
 
     return {
         "claim_id":        claim_id,
-        "is_valid":        all_valid,
-        "cortex_calls":    total_calls,
-        "retry_count":     total_retries,
+        "is_valid":        result["is_valid"],
+        "cortex_calls":    result["cortex_calls"],
+        "retry_count":     result["retry_count"],
         "processing_time": elapsed,
+        "node_path":       node_path,
     }
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def run(session, batch_size, max_workers, max_retries, stale_minutes):
+    global _session
+    _session = session
     start_time = time.time()
 
     unprocessed = session.sql(
