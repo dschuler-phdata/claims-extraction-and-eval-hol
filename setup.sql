@@ -1,4 +1,4 @@
-USE ROLE ACCOUNTADMIN;
+USE ROLE ATTENDEE_ROLE;
 ALTER ACCOUNT SET CORTEX_ENABLED_CROSS_REGION = 'ANY_REGION';
 
 CREATE DATABASE IF NOT EXISTS CLAIMS_EXTRACTION_LAB;
@@ -218,7 +218,7 @@ _session = None
 CORTEX_SQL = "SELECT SNOWFLAKE.CORTEX.COMPLETE('claude-sonnet-4-6', PARSE_JSON(?), PARSE_JSON(?)) :structured_output[0]:raw_message::STRING AS result"
 
 def cortex_complete(prompt_json, schema_json):
-    options = json.dumps({"temperature": 0, "response_format": {"type": "json", "schema": json.loads(schema_json)}})
+    options = json.dumps({"temperature": 0, "max_tokens": 8192, "response_format": {"type": "json", "schema": json.loads(schema_json)}})
     return _session.sql(CORTEX_SQL, [prompt_json, options]).collect()[0][0]
 
 
@@ -289,10 +289,22 @@ def extract_group_node(state: GroupWorkerState) -> dict:
     ])
 
     group_schema = json.dumps(schema_for_group(group_key))
-    result = cortex_complete(extraction_prompt, group_schema)
-    extracted = json.loads(result)
-    elapsed = time.time() - start_time
 
+    try:
+        result = cortex_complete(extraction_prompt, group_schema)
+        extracted = json.loads(result)
+    except Exception as e:
+        elapsed = time.time() - start_time
+        return {
+            "extracted_fields": {},
+            "extraction_errors": [{"field": "all", "message": f"Cortex extraction failed: {str(e)[:200]}", "type": "cortex_error", "input_value": ""}],
+            "is_valid": False,
+            "cortex_calls": 1,
+            "processing_time": elapsed,
+            "node_history": [f"extract_{group_key}_error"],
+        }
+
+    elapsed = time.time() - start_time
     return {
         "extracted_fields": extracted,
         "cortex_calls": 1,
@@ -417,8 +429,22 @@ def fix_group_node(state: GroupWorkerState) -> dict:
     ])
 
     group_schema = json.dumps(schema_for_group(group_key))
-    result = cortex_complete(fix_prompt, group_schema)
-    extracted = json.loads(result)
+
+    try:
+        result = cortex_complete(fix_prompt, group_schema)
+        extracted = json.loads(result)
+    except Exception as e:
+        elapsed = time.time() - start_time
+        return {
+            "extracted_fields": state.get("extracted_fields", {}),
+            "extraction_errors": [{"field": "all", "message": f"Cortex fix failed: {str(e)[:200]}", "type": "cortex_error", "input_value": ""}],
+            "is_valid": False,
+            "retry_count": state.get("retry_count", 0) + 1,
+            "cortex_calls": state.get("cortex_calls", 0) + 1,
+            "processing_time": state.get("processing_time", 0) + (time.time() - start_time),
+            "node_history": [f"fix_{group_key}_error"],
+        }
+
     elapsed = time.time() - start_time
 
     return {
@@ -520,8 +546,20 @@ worker_builder.add_node(node="extract_group", action=extract_group_node)
 worker_builder.add_node(node="validate_group", action=validate_group_node)
 worker_builder.add_node(node="fix_group", action=fix_group_node)
 
+def should_route_after_extract(state: GroupWorkerState) -> str:
+    """Route to fix if extraction returned malformed JSON, otherwise validate."""
+    if state.get("extraction_errors"):
+        if state.get("retry_count", 0) < state.get("max_retries", 2):
+            return "fix_group"
+        return END
+    return "validate_group"
+
 worker_builder.add_edge(start_key=START, end_key="extract_group")
-worker_builder.add_edge(start_key="extract_group", end_key="validate_group")
+worker_builder.add_conditional_edges(
+    source="extract_group",
+    path=should_route_after_extract,
+    path_map={"validate_group": "validate_group", "fix_group": "fix_group", END: END}
+)
 worker_builder.add_conditional_edges(
     source="validate_group",
     path=should_retry_group,
