@@ -2,8 +2,10 @@ name: app_environment
 channels:
   - snowflake
 dependencies:
+  - langchain-community=*
   - langchain-core=*
   - langgraph=*
   - pydantic=*
+  - pypdf=*
   - snowflake-ml-python=*
   - snowflake-snowpark-python=*
